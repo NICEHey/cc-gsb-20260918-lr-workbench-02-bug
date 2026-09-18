@@ -1,0 +1,11 @@
+{
+  "cases": [
+    {"key":"expression","label":"运算表达式","input":"id + id * id","grammar":{"version":1,"name":"运算表达式","start":"E","terminals":["id","+","*","(",")"],"productions":[{"id":"e-add","lhs":"E","rhs":["E","+","T"]},{"id":"e-term","lhs":"E","rhs":["T"]},{"id":"t-mul","lhs":"T","rhs":["T","*","F"]},{"id":"t-factor","lhs":"T","rhs":["F"]},{"id":"f-group","lhs":"F","rhs":["(","E",")"]},{"id":"f-id","lhs":"F","rhs":["id"]}]}},
+    {"key":"assignment","label":"LR1 可分辨而 SLR 冲突","input":"id = id","grammar":{"version":1,"name":"赋值与引用","start":"S","terminals":["id","*","="],"productions":[{"id":"s-assign","lhs":"S","rhs":["L","=","R"]},{"id":"s-value","lhs":"S","rhs":["R"]},{"id":"l-deref","lhs":"L","rhs":["*","R"]},{"id":"l-id","lhs":"L","rhs":["id"]},{"id":"r-l","lhs":"R","rhs":["L"]}]}},
+    {"key":"ambiguous","label":"移进归约冲突","input":"a a a","grammar":{"version":1,"name":"二义连接","start":"S","terminals":["a"],"productions":[{"id":"concat","lhs":"S","rhs":["S","S"]},{"id":"atom","lhs":"S","rhs":["a"]}]}},
+    {"key":"reduce-reduce","label":"归约归约冲突","input":"a","grammar":{"version":1,"name":"双重归约","start":"S","terminals":["a"],"productions":[{"id":"s-a","lhs":"S","rhs":["A"]},{"id":"s-b","lhs":"S","rhs":["B"]},{"id":"a-a","lhs":"A","rhs":["a"]},{"id":"b-a","lhs":"B","rhs":["a"]}]}},
+    {"key":"nullable","label":"空产生式传播","input":"a a b b","grammar":{"version":1,"name":"可空前后缀","start":"S","terminals":["a","b"],"productions":[{"id":"s-ab","lhs":"S","rhs":["A","B"]},{"id":"a-more","lhs":"A","rhs":["a","A"]},{"id":"a-empty","lhs":"A","rhs":[]},{"id":"b-more","lhs":"B","rhs":["b","B"]},{"id":"b-empty","lhs":"B","rhs":[]}]}},
+    {"key":"unmerged","label":"相同核心不可合并","input":"a c d","grammar":{"version":1,"name":"LR1 非 LALR","start":"S","terminals":["a","b","c","d","e"],"productions":[{"id":"s-ad","lhs":"S","rhs":["a","A","d"]},{"id":"s-be","lhs":"S","rhs":["b","A","e"]},{"id":"s-ae","lhs":"S","rhs":["a","B","e"]},{"id":"s-bd","lhs":"S","rhs":["b","B","d"]},{"id":"a-c","lhs":"A","rhs":["c"]},{"id":"b-c","lhs":"B","rhs":["c"]}]}},
+    {"key":"accept-reduce","label":"接受归约冲突","input":"a","grammar":{"version":1,"name":"开始符号单元循环","start":"S","terminals":["a"],"productions":[{"id":"s-loop","lhs":"S","rhs":["S"]},{"id":"s-a","lhs":"S","rhs":["a"]}]}}
+  ]
+}

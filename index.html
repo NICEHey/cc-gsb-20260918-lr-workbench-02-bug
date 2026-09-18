@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LR 文法冲突定位与逐符号分析工作台</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="title">
+    <h1>LR 文法冲突定位与逐符号分析工作台</h1>
+    <span class="subtitle">同一份文法 · SLR(1) 与规范 LR(1) 对照 · 真实构造项目集与分析表</span>
+  </div>
+  <div class="mode-switch" id="modeSwitch">
+    <label>分析模式</label>
+    <button type="button" data-mode="SLR" class="mode-btn active">SLR(1)</button>
+    <button type="button" data-mode="LR1" class="mode-btn">规范 LR(1)</button>
+    <span id="staleBadge" class="badge badge-stale hidden">表已过期 · 需重新生成</span>
+  </div>
+</header>
+
+<main>
+<!-- ============================ 1. 文法区 ============================ -->
+<section class="card" id="grammarSection">
+  <div class="card-head">
+    <h2>① 文法</h2>
+    <div class="head-actions">
+      <select id="fixtureSelect" title="载入 fixtures/grammars.json 样例"></select>
+      <button type="button" id="loadFixtureBtn">载入样例</button>
+      <button type="button" id="importBtn">导入草稿…</button>
+      <button type="button" id="exportDraftBtn">导出草稿</button>
+      <button type="button" id="generateBtn" class="primary">生成分析表</button>
+    </div>
+  </div>
+
+  <div class="grammar-grid">
+    <div class="form-row">
+      <label>文法名称</label>
+      <input type="text" id="nameInput" maxlength="80">
+    </div>
+    <div class="form-row">
+      <label>开始符号</label>
+      <input type="text" id="startInput" class="mono">
+    </div>
+    <div class="form-row form-row-wide">
+      <label>终结符列表（空白或逗号分隔，1～30 个）</label>
+      <input type="text" id="terminalsInput" class="mono">
+    </div>
+  </div>
+
+  <div class="prod-head">
+    <span class="col-id">产生式 ID（唯一）</span>
+    <span class="col-lhs">左部非终结符</span>
+    <span class="col-rhs">右部符号序列（空白分隔；留空表示 ε，至多 8 个）</span>
+    <span class="col-ops"></span>
+  </div>
+  <div id="prodList"></div>
+  <div class="prod-foot">
+    <button type="button" id="addProdBtn">＋ 新增产生式</button>
+    <span class="hint" id="prodCount"></span>
+  </div>
+
+  <div id="grammarMessages"></div>
+</section>
+
+<!-- ============================ 2. 状态 / 表格区 ============================ -->
+<section class="card" id="tableSection">
+  <div class="card-head">
+    <h2>② 项目集族与分析表</h2>
+    <div class="head-actions" id="tableActions">
+      <nav class="tabs" id="viewTabs">
+        <button type="button" data-tab="states" class="tab active">项目集族</button>
+        <button type="button" data-tab="table" class="tab">ACTION/GOTO</button>
+        <button type="button" data-tab="attrs" class="tab">nullable/FIRST/FOLLOW</button>
+        <button type="button" data-tab="conflicts" class="tab" id="conflictTab">冲突 <span id="conflictCount">(0)</span></button>
+      </nav>
+      <button type="button" id="exportTableBtn" disabled>导出分析表</button>
+    </div>
+  </div>
+
+  <div id="tableBanner" class="banner hidden"></div>
+  <div id="emptyTable" class="empty-hint">尚未生成分析表。编辑文法并点击「生成分析表」。</div>
+
+  <div id="tableContent" class="hidden">
+    <div class="table-grid">
+      <div class="table-main">
+        <!-- 项目集族 -->
+        <div class="tab-pane" id="pane-states">
+          <div class="state-layout">
+            <div class="state-nav">
+              <input type="search" id="stateFilter" placeholder="筛选状态（编号 / 符号 / 项目）…">
+              <div id="stateNav" class="state-nav-list"></div>
+            </div>
+            <div class="state-detail" id="stateDetail"></div>
+          </div>
+        </div>
+
+        <!-- ACTION/GOTO -->
+        <div class="tab-pane hidden" id="pane-table">
+          <div class="table-scroll">
+            <table id="parseTable"></table>
+          </div>
+          <p class="hint">点击任意单元格查看导致该动作的项目；冲突格保留全部候选动作。粗体列头 $ 为程序追加的结束符。</p>
+        </div>
+
+        <!-- 属性 -->
+        <div class="tab-pane hidden" id="pane-attrs">
+          <div id="attrsView"></div>
+        </div>
+
+        <!-- 冲突 -->
+        <div class="tab-pane hidden" id="pane-conflicts">
+          <div id="conflictsView"></div>
+        </div>
+      </div>
+
+      <aside class="inspector" id="inspector">
+        <h3>检查器</h3>
+        <div id="inspectorBody" class="inspector-body">
+          <p class="hint">点击转移、状态或 ACTION 单元格，这里会显示对应项目与判定依据。</p>
+        </div>
+      </aside>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ 3. 执行轨迹区 ============================ -->
+<section class="card" id="runSection">
+  <div class="card-head">
+    <h2>③ 输入分析（逐符号移进-归约）</h2>
+    <div class="head-actions">
+      <span id="runStatus" class="badge"></span>
+    </div>
+  </div>
+
+  <div class="run-controls">
+    <div class="run-input-row">
+      <label for="inputText">输入串（空白分隔的终结符；空输入合法；<b>$ 由程序追加，禁止输入</b>，至多 200 个 token）</label>
+      <input type="text" id="inputText" class="mono" placeholder="例如: id + id * id">
+    </div>
+    <div class="run-buttons">
+      <button type="button" id="startBtn" class="primary" disabled>开始</button>
+      <button type="button" id="stepBtn" disabled>前进一步</button>
+      <button type="button" id="backBtn" disabled>后退一步</button>
+      <button type="button" id="autoBtn" disabled>自动执行</button>
+      <button type="button" id="pauseBtn" class="hidden">暂停</button>
+      <button type="button" id="resetBtn" disabled>复位</button>
+      <label class="speed-label" for="speedSelect">速度</label>
+      <select id="speedSelect" disabled>
+        <option value="700">慢</option>
+        <option value="300" selected>中</option>
+        <option value="80">快</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="runMessage" class="banner hidden"></div>
+
+  <div id="traceEmpty" class="empty-hint">点击「开始」载入分析轨迹；有冲突的表禁止启动分析。</div>
+  <div id="traceContent" class="hidden">
+    <div class="snapshot-panel" id="snapshotPanel"></div>
+    <div class="trace-scroll">
+      <table id="traceTable"></table>
+    </div>
+  </div>
+</section>
+</main>
+
+<!-- 导入草稿模态框 -->
+<div id="importModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>导入草稿 JSON</h3>
+    <p class="hint">格式见 fixtures/format.md。校验失败时保留当前草稿、有效表与轨迹不变。</p>
+    <textarea id="importText" class="mono" spellcheck="false"
+      placeholder='{"version":1,"name":...,"start":...,"terminals":[...],"productions":[...]}'></textarea>
+    <div class="modal-ops">
+      <button type="button" id="importFileBtn">从文件选择…</button>
+      <input type="file" id="importFile" accept=".json,application/json" class="hidden">
+      <span class="spacer"></span>
+      <button type="button" id="importCancelBtn">取消</button>
+      <button type="button" id="importConfirmBtn" class="primary">导入</button>
+    </div>
+  </div>
+</div>
+
+<footer class="foot">
+  纯 Python 标准库 + 原生 HTML/CSS/JavaScript · 无第三方包、CDN 或外部服务 ·
+  增广产生式 0: @START → 开始符号（不写回草稿）
+</footer>
+
+<script src="core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
