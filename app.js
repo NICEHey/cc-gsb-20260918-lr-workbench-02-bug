@@ -38,11 +38,12 @@
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
   }
-  async function postJson(url, payload) {
+  async function postJson(url, payload, signal) {
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: signal || undefined,
     });
     let data = null;
     try { data = await resp.json(); } catch (_) { /* 非 JSON */ }
@@ -63,9 +64,6 @@
     if (act.type === "shift") return `移进, 转入状态 ${act.to}`;
     if (act.type === "reduce") return "按 " + C.productionText(table, act.production) + " 归约";
     return "接受";
-  }
-  function splitSymbols(raw) {
-    return raw.split(/[\s,，、]+/).filter((s) => s.length > 0);
   }
   /** 终结符排序: 普通终结符按 Unicode 码点, 结束符 $ 固定最后(表格列惯例)。 */
   function terminalOrder(table) {
@@ -146,7 +144,8 @@
       rhsIn.value = p.rhs.join(" "); rhsIn.placeholder = "留空 = ε";
       rhsIn.title = "右部符号用空白分隔; 留空表示 ε";
       rhsIn.addEventListener("input", () => {
-        p.rhs = splitSymbols(rhsIn.value).slice(0, C.LIMITS.maxRhs);
+        // 完整保留用户输入(含超限部分), 由校验报错并禁用生成; 绝不裁剪。
+        p.rhs = C.splitSymbols(rhsIn.value);
         markGrammarEdited(); renderMessages();
       });
 
@@ -215,7 +214,8 @@
       state.draft.start = e.target.value; markGrammarEdited(); renderMessages();
     });
     $("terminalsInput").addEventListener("input", (e) => {
-      state.draft.terminals = splitSymbols(e.target.value).slice(0, C.LIMITS.maxTerminals);
+      // 完整保留(含超过 30 个的部分), 由校验报错并禁用生成; 绝不裁剪。
+      state.draft.terminals = C.splitSymbols(e.target.value);
       markGrammarEdited(); renderMessages();
     });
     $("addProdBtn").addEventListener("click", addProduction);
@@ -352,43 +352,57 @@
   function bindGenerate() {
     $("generateBtn").addEventListener("click", generateTable);
   }
-  async function generateTable() {
+  function generateTable() {
     if (!C.canGenerate(state)) return;
+    // 固化本次请求对应的文法与模式; 响应回来后再次核对, 任何编辑都会作废旧请求。
+    const mode = state.mode;
+    const grammar = state.draft;
     const btn = $("generateBtn");
     btn.disabled = true; btn.textContent = "生成中…";
     clearBanner($("tableBanner"));
-    try {
-      const table = await postJson("api/build", { grammar: state.draft, mode: state.mode });
-      C.tableGenerated(state, table);
-      selectedState = 0;
-      selectedCell = null;
-      renderTableArea();
-      renderStaleness();
-      renderRunAvailability();
-      renderTraceArea();
-      const nConf = table.conflicts.length;
-      if (nConf) {
-        const kinds = C.conflictSummary(table);
+    C.runManagedRequest(state, "build", {
+      tokenInfo: { mode, grammarKey: C.grammarFingerprint(grammar) },
+      send: (signal) => postJson("api/build", { grammar, mode }, signal),
+      success: (table, token) => {
+        // 令牌(请求仍属当前) + 内容(模式/文法指纹)双核验后才生效。
+        if (!C.tableGenerated(state, table, token)) {
+          setBanner($("tableBanner"), "err",
+            "返回的分析表与当前文法/模式不一致，已丢弃；请重新生成。");
+          return;
+        }
+        selectedState = 0;
+        selectedCell = null;
+        renderTableArea();
+        renderStaleness();
+        renderRunAvailability();
+        renderTraceArea();
+        const nConf = table.conflicts.length;
+        if (nConf) {
+          const kinds = C.conflictSummary(table);
+          setBanner($("tableBanner"), "err",
+            `⚠ 分析表构造完成但存在 <b>${nConf}</b> 个冲突单元格` +
+            `（${Object.entries(kinds).map(([k, v]) => `${k} ×${v}`).join("，")}）。` +
+            `所有候选动作均已保留, 可查看与导出, 但<b>禁止启动输入分析</b>。`);
+        } else if (table.warnings && table.warnings.length) {
+          setBanner($("tableBanner"), "warn",
+            "分析表已生成, 无冲突。文法提示: " +
+            table.warnings.map(escapeHtml).join("；"));
+        } else {
+          setBanner($("tableBanner"), "ok",
+            `分析表已生成: ${state.mode} · ${table.states.length} 个状态 · 无冲突, 可以启动分析。`);
+        }
+      },
+      failure: (err) => {
         setBanner($("tableBanner"), "err",
-          `⚠ 分析表构造完成但存在 <b>${nConf}</b> 个冲突单元格` +
-          `（${Object.entries(kinds).map(([k, v]) => `${k} ×${v}`).join("，")}）。` +
-          `所有候选动作均已保留, 可查看与导出, 但<b>禁止启动输入分析</b>。`);
-      } else if (table.warnings && table.warnings.length) {
-        setBanner($("tableBanner"), "warn",
-          "分析表已生成, 无冲突。文法提示: " +
-          table.warnings.map(escapeHtml).join("；"));
-      } else {
-        setBanner($("tableBanner"), "ok",
-          `分析表已生成: ${state.mode} · ${table.states.length} 个状态 · 无冲突, 可以启动分析。`);
-      }
-    } catch (err) {
-      setBanner($("tableBanner"), "err",
-        "生成失败: " + escapeHtml(err.message) +
-        "<br>未产生新的分析表, 已有内容(若存在)保持不变。");
-    } finally {
-      btn.textContent = "生成分析表";
-      renderMessages();
-    }
+          "生成失败: " + escapeHtml(err.message) +
+          "<br>未产生新的分析表, 已有内容(若存在)保持不变。");
+      },
+      settled: () => {
+        btn.textContent = "生成分析表";
+        renderMessages();
+        renderStaleness();
+      },
+    });
   }
 
   // ---------------------------------------------------------------
@@ -428,6 +442,8 @@
     });
     $("generateBtn").disabled =
       grammarDisabled || C.validateDraft(state.draft).errors.length > 0;
+    // 在途建表一旦被文法/模式编辑作废即中止, 不会再有 settled 收尾, 在这里复位文案。
+    $("generateBtn").textContent = "生成分析表";
     renderMode();
   }
 
@@ -851,18 +867,27 @@
     const playing = state.playing;
     const hasPb = !!state.pb;
     const atEnd = hasPb && C.playbackAtEnd(state.pb);
+    // 当前【播放位置】状态, 不是服务器预计算的整条轨迹终态。
+    const posStatus = C.playbackStatus(state);
+    // 分析请求在途: 旧轨迹的步进控件也必须临时锁住, 防止操作即将被替换的轨迹。
+    const parsing = C.isRequestPending(state, "parse");
 
     $("inputText").disabled = playing;
     $("speedSelect").disabled = playing || !hasPb;
-    $("startBtn").disabled = !noConflict || playing;
-    $("stepBtn").disabled = !hasPb || playing || atEnd;
-    $("backBtn").disabled = !hasPb || playing || state.pb.pos === 0;
+    $("startBtn").disabled = !noConflict || playing || parsing;
+    $("stepBtn").disabled = !hasPb || playing || parsing || atEnd;
+    $("backBtn").disabled = !hasPb || playing || parsing || state.pb.pos === 0;
     $("autoBtn").classList.toggle("hidden", playing);
     $("pauseBtn").classList.toggle("hidden", !playing);
-    $("autoBtn").disabled = !hasPb || atEnd;
-    $("resetBtn").disabled = !hasPb;
+    $("autoBtn").disabled = !hasPb || parsing || atEnd;
+    $("resetBtn").disabled = !hasPb || parsing;
 
     const status = $("runStatus");
+    if (parsing) {
+      status.textContent = "分析请求中…";
+      status.className = "badge badge-info";
+      return;
+    }
     if (!fresh) {
       status.textContent = "表未生成/已过期";
       status.className = "badge badge-stale";
@@ -873,10 +898,15 @@
       status.textContent = "自动执行中…";
       status.className = "badge badge-info";
     } else if (hasPb) {
-      const st = state.trace.status;
-      status.textContent = { accepted: "已接受", error: "出错", limit: "超步终止" }[st] || "就绪";
+      // 0 步时即便轨迹最终 accepted 也只显示"就绪"; 仅当前位置那步是 accept 才"已接受";
+      // 回退离开 accept 步后恢复未完成状态。
+      const map = { ready: "就绪（尚未执行）", running: "执行中", accepted: "已接受",
+        error: "出错", limit: "超步终止" };
+      status.textContent = map[posStatus] || "就绪";
       status.className = "badge " +
-        (st === "accepted" ? "badge-ok" : st === "error" ? "badge-err" : "badge-stale");
+        (posStatus === "accepted" ? "badge-ok"
+          : posStatus === "error" || posStatus === "limit" ? "badge-err"
+          : "badge-stale");
     } else {
       status.textContent = "表无冲突 · 可开始";
       status.className = "badge badge-ok";
@@ -894,25 +924,38 @@
     renderPlayback();
   }
 
-  async function startAnalysis() {
+  function startAnalysis() {
     if (!C.canRunAnalysis(state) || state.playing) return;
+    // 固化本次分析对应的文法/模式/输入; 之后任何编辑都会令其过期。
+    const grammar = state.draft;
+    const mode = state.mode;
+    const input = state.input;
+    const tableKey = state.tableKey;
     clearBanner($("runMessage"));
     $("startBtn").disabled = true;
-    try {
-      const result = await postJson("api/parse", {
-        grammar: state.draft, mode: state.mode, input: state.input,
-      });
-      // 以返回结果为准; 未知符号会在服务器开始前报错(走 catch), 不会到这里
-      C.traceLoaded(state, result);
-      renderRunAvailability();
-      renderTraceArea();
-      renderTableHighlights();
-      if (result.status === "error") showTraceEndMessage(result);
-    } catch (err) {
-      setBanner($("runMessage"), "err", "无法开始分析: " + escapeHtml(err.message));
-    } finally {
-      renderRunAvailability();
-    }
+    C.runManagedRequest(state, "parse", {
+      tokenInfo: { input, tableKey },
+      send: (signal) => postJson("api/parse", { grammar, mode, input }, signal),
+      success: (result, token) => {
+        // 身份 + 输入 + 表身份三重核对通过后, 轨迹才允许落到当前界面。
+        if (!C.traceLoaded(state, result, token)) return;
+        renderRunAvailability();
+        renderTraceArea();
+        renderTableHighlights();
+        // 仅"已走到出错位置"才提示; 刚载入(0 步)不展示终态横幅。
+        if (C.playbackFinished(state) &&
+            (result.status === "error" || result.status === "limit")) {
+          showTraceEndMessage(result);
+        }
+      },
+      failure: (err) => {
+        setBanner($("runMessage"), "err", "无法开始分析: " + escapeHtml(err.message));
+      },
+      settled: () => {
+        renderRunAvailability();
+      },
+    });
+    renderRunAvailability(); // 立即进入"分析请求中", 锁住旧轨迹的步进控件
   }
 
   function showTraceEndMessage(result) {
@@ -1043,8 +1086,17 @@
     renderRunAvailability();
     renderTableHighlights();
 
-    if (pb.pos === trace.steps.length) showTraceEndMessage(trace);
-    else clearBanner($("runMessage"));
+    // 终态提示只与"当前播放位置"绑定: 刚载入(0 步)或后退离开末步都不显示。
+    const posStatus = C.playbackStatus(state);
+    if (posStatus === "error" || posStatus === "limit") {
+      showTraceEndMessage(trace);
+    } else if (posStatus === "accepted") {
+      setBanner($("runMessage"), "ok",
+        `✓ 已在第 ${record.index} 步接受，输入分析成功。` +
+        `（后退可回到接受之前的步骤继续查看。）`);
+    } else {
+      clearBanner($("runMessage"));
+    }
   }
 
   // ---------------------------------------------------------------

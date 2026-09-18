@@ -305,49 +305,42 @@ class Grammar:
 
     # -- 文法符号层的 FIRST/nullable 计算 --
 
+    def _symbol_nullable(self, s: str) -> bool:
+        """单个符号能否推出空串。
+
+        终结符(含结束符 $)永远不可空; 非终结符查 nullable 表,
+        尚未推出可空时按不可空处理(不动点会在后续轮次修正)。
+        """
+        if s in self.terminal_set or s == END:
+            return False
+        return bool(self.nullable.get(s, False))
+
     def compute_attributes(self) -> None:
         nts = self.nonterminals
         nullable = {a: False for a in nts}
         first: dict[str, set[str]] = {a: set() for a in nts}
 
+        # 局部字典会被原地修改, 提前挂到 self 供 _symbol_nullable 等读取最新值。
+        self.nullable = nullable
+        self.first = first
+
+        # nullable / FIRST 联合不动点: 两者都是单调集合, 同轮传播仍会收敛。
         changed = True
         while changed:
             changed = False
             for idx in range(1, len(self.productions)):
                 lhs, rhs = self.productions[idx]
-                # nullable: 右部为空, 或右部符号全部可空
-                if not rhs:
-                    if not nullable[lhs]:
-                        nullable[lhs] = True
-                        changed = True
-                elif all(s in self.terminal_set or nullable.get(s) for s in rhs):
-                    if not nullable[lhs]:
-                        nullable[lhs] = True
-                        changed = True
-                # FIRST: 依次取右部符号的 FIRST, 遇不可空即止
-                all_null = True
-                for s in rhs:
-                    if s in self.terminal_set:
-                        if s not in first[lhs]:
-                            first[lhs].add(s)
-                            changed = True
-                        all_null = False
-                        break
-                    before = len(first[lhs])
-                    first[lhs] |= {x for x in first[s] if x != EPS}
-                    if len(first[lhs]) != before:
-                        changed = True
-                    if not nullable[s]:
-                        all_null = False
-                        break
-                if all_null:
-                    if EPS not in first[lhs]:
-                        first[lhs].add(EPS)
-                        changed = True
-
-        # FIRST/nullable 定点结束, 先挂到 self(FOLLOW 计算依赖 self._first_seq)
-        self.nullable = nullable
-        self.first = first
+                # nullable(A → X1..Xn): 空右部立即可空; 否则右部每个符号
+                # 都必须是可空【非终结符】—— 终结符绝不能算可空。
+                if not nullable[lhs] and all(self._symbol_nullable(s) for s in rhs):
+                    nullable[lhs] = True
+                    changed = True
+                # FIRST(lhs): 从左到右只能越过"可空前缀";
+                # 遇终结符或不可空非终结符即止, 全可空才补 ε。
+                before = len(first[lhs])
+                first[lhs] |= self._first_seq_from(rhs, nullable, first)
+                if len(first[lhs]) != before:
+                    changed = True
 
         follow: dict[str, set[str]] = {a: set() for a in nts}
         follow[self.start].add(END)
@@ -378,29 +371,35 @@ class Grammar:
         self.follow = follow
 
     def _seq_nullable(self, seq) -> bool:
+        """符号串整体可空 ⇔ 每个符号都是可空非终结符。
+
+        空串(长度 0)视为可空; 任何终结符出现即不可空。
+        """
         for s in seq:
-            if s in self.terminal_set or s == END:
-                return False
-            if not self.nullable.get(s):
+            if not self._symbol_nullable(s):
                 return False
         return True
 
-    def _first_seq(self, seq) -> set[str]:
-        """符号串的 FIRST 集合(可能含 ε)。终结符(含结束符 $)直接返回自身。"""
+    def _first_seq_from(self, seq, nullable, first) -> set[str]:
+        """不动点迭代中可用的符号串 FIRST(可能含 ε)。
+
+        从左至右: 终结符贡献自身后停止; 非终结符贡献其 FIRST 中的终结符,
+        仅当其可空时才继续越过; 全部可空才加入 ε。
+        """
         out: set[str] = set()
-        all_null = True
         for s in seq:
             if s in self.terminal_set or s == END:
                 out.add(s)
-                all_null = False
-                break
-            out |= {x for x in self.first[s] if x != EPS}
-            if not self.nullable[s]:
-                all_null = False
-                break
-        if all_null:
-            out.add(EPS)
+                return out  # 终结符不可空, 串首符已确定
+            out |= {x for x in first.get(s, ()) if x != EPS}
+            if not nullable.get(s, False):
+                return out
+        out.add(EPS)
         return out
+
+    def _first_seq(self, seq) -> set[str]:
+        """定点后的符号串 FIRST(可能含 ε)。终结符(含结束符 $)贡献自身。"""
+        return self._first_seq_from(seq, self.nullable, self.first)
 
     def first_after(self, beta, lookahead: str) -> set[str]:
         """FIRST(beta a): LR(1) closure 传播用, 结果必为终结符集合。"""

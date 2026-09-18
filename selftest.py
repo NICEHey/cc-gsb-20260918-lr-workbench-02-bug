@@ -143,6 +143,66 @@ check("FIRST(S) 为 a,b", set(ct["first"]["S"]) == {"a", "b"}, str(ct["first"]["
 check("FOLLOW(A) 含 b", "b" in ct["follow"]["A"])
 check("C 可空 → FOLLOW(C) 含 $", L.END in ct["follow"]["C"])
 
+# 回归: 报告中的"无空产生式却报 reduce/reduce"文法。
+# 旧缺陷把终结符当作可空, 导致 A、B 误判可空、FIRST(S) 混入 b/ε、状态 3 的 $ 格伪冲突。
+pc = L.build_table(grammar("pseudo-conflict"), L.MODE_SLR)
+pc_l = L.build_table(grammar("pseudo-conflict"), L.MODE_LR1)
+check("无空产生式文法 nullable 必须为空(SLR)", pc["nullable"] == [], str(pc["nullable"]))
+check("无空产生式文法 nullable 必须为空(LR1)", pc_l["nullable"] == [])
+check("FIRST(S) 仅 {a}, 不含 b/ε/*/+",
+      set(pc["first"]["S"]) == {"a"}, str(pc["first"]["S"]))
+check("FIRST(A)={a}, FIRST(B)={b}",
+      set(pc["first"]["A"]) == {"a"} and set(pc["first"]["B"]) == {"b"})
+check("FOLLOW(A)={b}, 终结符 b 阻断后不继承 $",
+      set(pc["follow"]["A"]) == {"b"}, str(pc["follow"]["A"]))
+check("FOLLOW(B)={$}", set(pc["follow"]["B"]) == {L.END})
+check("两种模式状态 3 的 $ 格均无 reduce2/reduce3 伪冲突",
+      not pc["conflicts"] and not pc_l["conflicts"],
+      f"{pc['conflicts']} {pc_l['conflicts']}")
+check("合法输入 a 两种模式均接受",
+      L.parse(pc, "a")["status"] == "accepted"
+      and L.parse(pc_l, "a")["status"] == "accepted")
+check("合法输入 a b 两种模式均接受",
+      L.parse(pc, "a b")["status"] == "accepted"
+      and L.parse(pc_l, "a b")["status"] == "accepted")
+check("非法输入 a a 报错而非接受(无伪归约路径)",
+      L.parse(pc, "a a")["status"] == "error")
+
+# 表达式文法: E/T/F 都不可空, FIRST(E) 绝不能含 +/*/ε
+check("表达式 E/T/F 均不可空",
+      set(expr_s["nullable"]) == set(), str(expr_s["nullable"]))
+check("FIRST(E) = {id, (}, 不含 + * ε",
+      set(expr_s["first"]["E"]) == {"id", "("}, str(expr_s["first"]["E"]))
+check("FIRST(F) = {id, (}",
+      set(expr_s["first"]["F"]) == {"id", "("}, str(expr_s["first"]["F"]))
+
+# 间接可空 + 多层依赖 + 含终结符的非空链
+deep = {"version": 1, "name": "deep", "start": "S", "terminals": ["a", "b", "c"],
+        "productions": [
+            {"id": "s", "lhs": "S", "rhs": ["P", "Q", "R", "c"]},
+            {"id": "p", "lhs": "P", "rhs": ["U"]},
+            {"id": "u", "lhs": "U", "rhs": []},          # U 可空 → P 间接可空
+            {"id": "q1", "lhs": "Q", "rhs": ["V", "b"]},  # 含终结符 b, Q 不可空
+            {"id": "q2", "lhs": "Q", "rhs": []},
+            {"id": "v", "lhs": "V", "rhs": []},
+            {"id": "r1", "lhs": "R", "rhs": ["a"]},       # R 不可空
+        ]}
+dt = L.build_table(deep, L.MODE_SLR)
+check("间接可空: U、P、V、Q 可空, R/S 不可空",
+      set(dt["nullable"]) == {"P", "Q", "U", "V"}, str(dt["nullable"]))
+check("FIRST 越过可空 P、Q(贡献 b), 止于不可空 R(贡献 a), 到不了末尾 c",
+      set(dt["first"]["S"]) == {"a", "b"}, str(dt["first"]["S"]))
+check("末尾 c 出现在 FOLLOW(R) 而非 FIRST(S)",
+      "c" in dt["follow"]["R"] and "c" not in dt["first"]["S"])
+
+# 不生成句子的自循环: 非终结符 X -> X 永不可空, 也不污染 FIRST
+cyc = {"version": 1, "name": "cyc", "start": "S", "terminals": ["a"],
+       "productions": [{"id": "s", "lhs": "S", "rhs": ["a"]},
+                       {"id": "x", "lhs": "X", "rhs": ["X"]}]}
+xt = L.build_table(cyc, L.MODE_SLR)
+check("不生成句子的循环 X 不可空、FIRST 为空",
+      "X" not in xt["nullable"] and xt["first"]["X"] == [], str(xt["nullable"]))
+
 
 # ---------------------------------------------------------------------------
 # 3. 多冲突动作保留
@@ -276,6 +336,30 @@ expect_errors(bad, ["重复"])
 bad = copy.deepcopy(base); bad["productions"][0]["rhs"] = ["E", "+", "T", "T", "T",
                                                            "T", "T", "T", "T"]
 expect_errors(bad, [str(L.MAX_RHS)])
+
+# 右部恰好 8 合法, 9 拒绝; 拒绝时 9 个符号必须原样保留(后端绝不裁剪)
+ok8 = copy.deepcopy(base)
+ok8["productions"] = [{"id": "s", "lhs": "E", "rhs": ["id"] * 8}]
+c8, e8, _ = L.validate_grammar(ok8)
+check("右部恰好 8 个符号合法", c8 is not None and not e8, str(e8))
+bad9 = copy.deepcopy(base)
+bad9["productions"] = [{"id": "s", "lhs": "E", "rhs": ["id"] * 9}]
+c9, e9, _ = L.validate_grammar(bad9)
+check("右部 9 个符号被拒", c9 is None and any(str(L.MAX_RHS) in e for e in e9), str(e9))
+check("拒绝后右部仍完整保留 9 个(不静默裁剪)",
+      len(bad9["productions"][0]["rhs"]) == 9)
+
+# 终结符恰好 30 合法, 31 拒绝且完整保留
+def terms_draft(n):
+    return {"version": 1, "name": "tn", "start": "S",
+            "terminals": [f"t{i:02d}" for i in range(n)],
+            "productions": [{"id": "s", "lhs": "S", "rhs": [f"t{n-1:02d}"]}]}
+c30, e30, _ = L.validate_grammar(terms_draft(30))
+check("终结符恰好 30 个合法", c30 is not None and not e30, str(e30))
+d31 = terms_draft(31)
+c31, e31, _ = L.validate_grammar(d31)
+check("终结符 31 个被拒", c31 is None and any(str(L.MAX_TERMINALS) in e for e in e31), str(e31))
+check("拒绝后 31 个终结符仍完整保留(不静默裁剪)", len(d31["terminals"]) == 31)
 bad = copy.deepcopy(base)
 bad["productions"] = base["productions"] * 7  # 42 > 40
 expect_errors(bad, [str(L.MAX_PRODUCTIONS)])
@@ -377,7 +461,127 @@ check("导出可序列化为 JSON", True)
 
 
 # ---------------------------------------------------------------------------
-# 9. 前端失效规则(若存在 node)
+# 9b. HTTP 接口级回归(真实启动 server.py, 验证页面所用三个 API 与导出完整性)
+# ---------------------------------------------------------------------------
+section("HTTP 接口: /api/validate /api/build /api/parse")
+
+import socket
+import urllib.request
+import urllib.error
+
+
+def _free_port():
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
+def _api(root, path, payload):
+    req = urllib.request.Request(
+        root + path, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+_server = None
+try:
+    port = _free_port()
+    _server = subprocess.Popen(
+        [sys.executable, "server.py", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    root = f"http://127.0.0.1:{port}"
+    import time as _time
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(root + "/", timeout=1).read()
+            break
+        except OSError:
+            _time.sleep(0.1)
+
+    # validate 合法草稿
+    st, v = _api(root, "/api/validate", {"grammar": grammar("pseudo-conflict")})
+    check("HTTP validate 合法", st == 200 and v["valid"] is True and v["errors"] == [],
+          str(v)[:200])
+
+    # build 伪冲突文法: 页面/接口同源, nullable 空、无冲突、grammar 完整 4 条
+    st, t = _api(root, "/api/build",
+                 {"grammar": grammar("pseudo-conflict"), "mode": "SLR"})
+    check("HTTP build 伪冲突文法 200", st == 200, str(t)[:200])
+    check("HTTP 表 nullable 为空", t.get("nullable") == [], str(t.get("nullable")))
+    check("HTTP 表无冲突", t.get("conflicts") == [], str(t.get("conflicts")))
+    check("HTTP 表带回完整 4 条产生式",
+          len(t["grammar"]["productions"]) == 4)
+
+    # parse a 与 a b 接受; 导出的同一张表能解释
+    for inp in ("a", "a b"):
+        st, r = _api(root, "/api/parse",
+                     {"grammar": grammar("pseudo-conflict"), "mode": "SLR",
+                      "input": inp})
+        check(f"HTTP parse {inp!r} 接受",
+              st == 200 and r["status"] == "accepted", f"{st} {str(r)[:200]}")
+        check("接受轨迹最后一步为 accept",
+              r["steps"][-1]["action"]["type"] == "accept")
+        check("0 步预计算不会改变: steps 里 accept 是最后一步而非开局",
+              r["status"] == "accepted" and len(r["steps"]) >= 1)
+
+    # 右部 8: 建表成功且导出 grammar 完整保留 8 个符号
+    g8 = copy.deepcopy(base)
+    g8["productions"] = [{"id": "s", "lhs": "E", "rhs": ["id"] * 8}]
+    st, t8 = _api(root, "/api/build", {"grammar": g8, "mode": "SLR"})
+    check("HTTP 右部 8 建表成功", st == 200 and len(t8["grammar"]["productions"][0]["rhs"]) == 8,
+          f"{st} {str(t8)[:200]}")
+
+    # 右部 9: 建表必须 400 报错, 绝不返回"裁剪后有效"的表
+    g9 = copy.deepcopy(base)
+    g9["productions"] = [{"id": "s", "lhs": "E", "rhs": ["id"] * 9}]
+    st, t9 = _api(root, "/api/build", {"grammar": g9, "mode": "SLR"})
+    check("HTTP 右部 9 建表被拒(400)且无表",
+          st == 400 and "error" in t9 and "states" not in t9, f"{st} {str(t9)[:200]}")
+
+    # 终结符 31: 建表拒绝; 30: 通过
+    st31, r31 = _api(root, "/api/build",
+                     {"grammar": terms_draft(31), "mode": "SLR"})
+    check("HTTP 终结符 31 建表被拒", st31 == 400 and "30" in r31.get("error", ""),
+          f"{st31} {str(r31)[:200]}")
+    st30, t30 = _api(root, "/api/build",
+                     {"grammar": terms_draft(30), "mode": "SLR"})
+    check("HTTP 终结符 30 建表成功且完整保留",
+          st30 == 200 and len(t30["grammar"]["terminals"]) == 30,
+          f"{st30} {str(t30)[:200]}")
+
+    # 有冲突的表仍可经 API 正常返回(可导出), 但 /api/parse 拒绝
+    st, ta = _api(root, "/api/build",
+                  {"grammar": grammar("ambiguous"), "mode": "SLR"})
+    check("HTTP 冲突表正常返回(可导出)", st == 200 and bool(ta["conflicts"]), f"{st}")
+    st, rp = _api(root, "/api/parse",
+                  {"grammar": grammar("ambiguous"), "mode": "SLR", "input": "a"})
+    check("HTTP 冲突表禁止分析", st == 400 and "冲突" in rp.get("error", ""),
+          f"{st} {rp}")
+
+    # 错误串: 保留成功前缀且不接受
+    st, rb = _api(root, "/api/parse",
+                  {"grammar": grammar("expression"), "mode": "SLR",
+                   "input": "id + * id"})
+    check("HTTP 错误串 status=error 且前缀 id +",
+          st == 200 and rb["status"] == "error"
+          and rb["error"]["symbol"] == "*" and rb["error"]["prefix"] == ["id", "+"],
+          str(rb)[:200])
+finally:
+    if _server is not None:
+        _server.terminate()
+        try:
+            _server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _server.kill()
+
+
+# ---------------------------------------------------------------------------
+# 10. 前端失效规则(若存在 node)
 # ---------------------------------------------------------------------------
 section("前端纯逻辑与失效规则")
 
