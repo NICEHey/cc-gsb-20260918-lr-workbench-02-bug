@@ -117,6 +117,48 @@ check("LR1 项目逐个导出 lookahead",
 # ---------------------------------------------------------------------------
 section("nullable / FIRST / FOLLOW 传播")
 
+# 回归: 曾因"终结符被当作可空符号"导致的伪冲突。
+# S→A B | a, A→a, B→b: 没有任何 ε 产生式, nullable 必须为空,
+# FIRST(S)={a}, FOLLOW(A)={b}, 两种模式都无冲突, a 与 a b 都应被接受。
+pseudo = {"version": 1, "name": "伪冲突回归", "start": "S", "terminals": ["a", "b"],
+          "productions": [
+              {"id": "p1", "lhs": "S", "rhs": ["A", "B"]},
+              {"id": "p2", "lhs": "S", "rhs": ["a"]},
+              {"id": "p3", "lhs": "A", "rhs": ["a"]},
+              {"id": "p4", "lhs": "B", "rhs": ["b"]}]}
+for pseudo_mode in (L.MODE_SLR, L.MODE_LR1):
+    pt = L.build_table(pseudo, pseudo_mode)
+    check(f"[{pseudo_mode}] 无 ε 产生式时 nullable 为空",
+          pt["nullable"] == [], str(pt["nullable"]))
+    check(f"[{pseudo_mode}] FIRST(S)={{a}}(不得混入 ε/*/+)",
+          pt["first"]["S"] == ["a"], str(pt["first"]["S"]))
+    check(f"[{pseudo_mode}] FIRST(A)={{a}}, FIRST(B)={{b}}",
+          pt["first"]["A"] == ["a"] and pt["first"]["B"] == ["b"],
+          f"{pt['first']['A']} {pt['first']['B']}")
+    check(f"[{pseudo_mode}] FOLLOW(A)={{b}}, FOLLOW(B)={{$}}",
+          pt["follow"]["A"] == ["b"] and pt["follow"]["B"] == [L.END],
+          f"{pt['follow']['A']} {pt['follow']['B']}")
+    check(f"[{pseudo_mode}] 状态3 的 $ 格只有 r2(不是 r2/r3 伪冲突)",
+          pt["states"][3]["action"].get("$") == [{"type": "reduce", "production": 2}],
+          str(pt["states"][3]["action"].get("$")))
+    check(f"[{pseudo_mode}] 无任何冲突", pt["conflicts"] == [], str(pt["conflicts"]))
+    check(f"[{pseudo_mode}] a 被接受", L.parse(pt, "a")["status"] == "accepted")
+    check(f"[{pseudo_mode}] a b 被接受", L.parse(pt, "a b")["status"] == "accepted")
+    pa = L.parse(pt, "a a")
+    check(f"[{pseudo_mode}] a a 出错但保留成功前缀 ['a']",
+          pa["status"] == "error" and pa["error"]["prefix"] == ["a"]
+          and set(pa["error"]["expected"]) == {L.END, "b"},
+          str(pa.get("error")))
+
+# 回归: 表达式文法终结符绝不能被当成可空符号
+check("表达式文法 nullable 为空(E/F/T 都不能推出 ε)",
+      expr_s["nullable"] == [], str(expr_s["nullable"]))
+check("FIRST(E)=FIRST(T)=FIRST(F)={id,(}(不含 + * ε)",
+      expr_s["first"]["E"] == ["(", "id"]
+      and expr_s["first"]["T"] == ["(", "id"]
+      and expr_s["first"]["F"] == ["(", "id"],
+      f"{expr_s['first']['E']} {expr_s['first']['T']} {expr_s['first']['F']}")
+
 nul = L.build_table(grammar("nullable"), L.MODE_SLR)
 check("A、B 均可空(S 也随之可空)",
       {"A", "B"} <= set(nul["nullable"]), str(nul["nullable"]))
@@ -142,6 +184,85 @@ check("链中 C 可空", "C" in ct["nullable"] and "A" in ct["nullable"])
 check("FIRST(S) 为 a,b", set(ct["first"]["S"]) == {"a", "b"}, str(ct["first"]["S"]))
 check("FOLLOW(A) 含 b", "b" in ct["follow"]["A"])
 check("C 可空 → FOLLOW(C) 含 $", L.END in ct["follow"]["C"])
+
+# 间接可空(多层依赖): S→A B, A→C, C→ε, B→D, D→d
+# C/A 可空但 B 链路上有终结符 d → B、S 不可空; 终结符切断可空传播。
+ind = {"version": 1, "name": "间接", "start": "S", "terminals": ["d"],
+       "productions": [
+           {"id": "1", "lhs": "S", "rhs": ["A", "B"]},
+           {"id": "2", "lhs": "A", "rhs": ["C"]},
+           {"id": "3", "lhs": "C", "rhs": []},
+           {"id": "4", "lhs": "B", "rhs": ["D"]},
+           {"id": "5", "lhs": "D", "rhs": ["d"]}]}
+it2 = L.build_table(ind, L.MODE_SLR)
+check("间接可空: 仅 A、C 可空, B/S 不可空",
+      set(it2["nullable"]) == {"A", "C"}, str(it2["nullable"]))
+check("终结符切断: FIRST(S)={d} 无 ε",
+      it2["first"]["S"] == ["d"], str(it2["first"]["S"]))
+check("FOLLOW(A)=FOLLOW(C)={d}(A 后是含终结符的不可空 B)",
+      it2["follow"]["A"] == ["d"] and it2["follow"]["C"] == ["d"],
+      f"{it2['follow']['A']} {it2['follow']['C']}")
+
+# 合法左递归: E→E a | ε
+leftrec = {"version": 1, "name": "左递归", "start": "E", "terminals": ["a"],
+           "productions": [
+               {"id": "1", "lhs": "E", "rhs": ["E", "a"]},
+               {"id": "2", "lhs": "E", "rhs": []}]}
+lt = L.build_table(leftrec, L.MODE_SLR)
+check("左递归可空: nullable={E}", lt["nullable"] == ["E"], str(lt["nullable"]))
+check("左递归 FIRST(E)={a,ε}", set(lt["first"]["E"]) == {"a", L.EPS}, str(lt["first"]["E"]))
+check("左递归 FOLLOW(E)={$,a}", set(lt["follow"]["E"]) == {"a", L.END}, str(lt["follow"]["E"]))
+
+# 不生成句子的循环 A→A: A 不可空、FIRST(A) 为空, 不动点必须终止
+cyc = {"version": 1, "name": "循环", "start": "S", "terminals": ["a"],
+       "productions": [
+           {"id": "1", "lhs": "S", "rhs": ["a"]},
+           {"id": "2", "lhs": "A", "rhs": ["A"]}]}
+cyt = L.build_table(cyc, L.MODE_SLR)
+check("自循环 A 不可空", "A" not in cyt["nullable"], str(cyt["nullable"]))
+check("自循环 FIRST(A) 为空且计算终止", cyt["first"]["A"] == [])
+
+# 计算符号串 FIRST: 只能越过可空的非终结符前缀, 遇终结符即止
+cg = L.Grammar(lt["grammar"])
+cg.compute_attributes()
+check("_first_seq 遇终结符停止",
+      cg._first_seq(["a", "E"]) == {"a"})
+check("_first_seq 越过可空非终结符但被其后的终结符截断(不残留 ε)",
+      cg._first_seq(["E", "a"]) == {"a"}, str(cg._first_seq(["E", "a"])))
+check("FIRST(β$) 末尾 $ 作为终结符计入, ε 被丢弃",
+      cg.first_after(["E"], L.END) == {"a", L.END},
+      str(cg.first_after(["E"], L.END)))
+
+# ---------------------------------------------------------------------------
+# 2b. 边界校验: 右部 8/9、终结符 30/31 —— 超限完整保留待修正输入, 禁止生成
+# ---------------------------------------------------------------------------
+section("右部/终结符边界(不裁剪)")
+
+g8 = copy.deepcopy(grammar("expression"))
+g8["productions"][0]["rhs"] = ["id"] * 8
+check("右部 8 个符号合法", L.validate_grammar(g8)[1] == [])
+g9 = copy.deepcopy(grammar("expression"))
+g9["productions"][0]["rhs"] = ["id"] * 9
+clean9, errs9, _ = L.validate_grammar(g9)
+check("右部 9 个符号被拒", clean9 is None and any("右部最多 8" in e for e in errs9), str(errs9))
+check("校验拒绝时原样保留 9 个符号(不裁剪)",
+      len(g9["productions"][0]["rhs"]) == 9 and g9["productions"][0]["rhs"] == ["id"] * 9)
+
+t30 = {"version": 1, "name": "t", "start": "S",
+       "terminals": [f"t{i}" for i in range(30)],
+       "productions": [{"id": "s", "lhs": "S", "rhs": ["t0"]}]}
+check("30 个终结符合法", L.validate_grammar(t30)[1] == [])
+t31 = copy.deepcopy(t30)
+t31["terminals"] = [f"t{i}" for i in range(31)]
+clean31, errs31, _ = L.validate_grammar(t31)
+check("31 个终结符被拒", clean31 is None and any("1~30" in e for e in errs31), str(errs31))
+check("31 个终结符原样保留", len(t31["terminals"]) == 31)
+# 超限草稿在 build/parse 阶段同样被拒, 绝不返回"裁剪后有效"的表
+try:
+    L.build_table(g9, L.MODE_SLR)
+    check("右部 9 个符号不能建表", False)
+except L.GrammarError:
+    check("右部 9 个符号不能建表", True)
 
 
 # ---------------------------------------------------------------------------
@@ -383,14 +504,24 @@ section("前端纯逻辑与失效规则")
 
 node = shutil.which("node")
 if node:
-    proc = subprocess.run([node, "tests/frontend.test.js"],
-                          cwd=os.path.dirname(os.path.abspath(__file__)),
-                          capture_output=True, text=True)
-    ok = proc.returncode == 0
-    check("node 前端自测通过", ok, proc.stdout + proc.stderr)
-    if not ok:
-        print(proc.stdout)
-        print(proc.stderr)
+    def run_node(test_file, label):
+        proc = subprocess.run([node, test_file],
+                              cwd=os.path.dirname(os.path.abspath(__file__)),
+                              capture_output=True, text=True)
+        ok = proc.returncode == 0
+        check(label, ok, proc.stdout + proc.stderr)
+        if not ok:
+            print(proc.stdout)
+            print(proc.stderr)
+
+    run_node("tests/frontend.test.js", "node 前端纯逻辑自测通过")
+    # 页面级测试(真实 index.html + app.js, 仅注入可控 fetch): 需要本地 jsdom。
+    jsdom_present = os.path.isdir(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "node_modules", "jsdom"))
+    if jsdom_present:
+        run_node("tests/page.test.js", "node 页面级回归(异步乱序/编辑边界/回放)通过")
+    else:
+        print("   (跳过页面级测试: 未找到 node_modules/jsdom; 可执行 npm i jsdom --no-save)")
 else:
     print("   (跳过 node 前端测试: 未找到 node)")
 

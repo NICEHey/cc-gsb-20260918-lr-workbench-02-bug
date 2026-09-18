@@ -315,34 +315,32 @@ class Grammar:
             changed = False
             for idx in range(1, len(self.productions)):
                 lhs, rhs = self.productions[idx]
-                # nullable: 右部为空, 或右部符号全部可空
-                if not rhs:
-                    if not nullable[lhs]:
-                        nullable[lhs] = True
-                        changed = True
-                elif all(s in self.terminal_set or nullable.get(s) for s in rhs):
-                    if not nullable[lhs]:
-                        nullable[lhs] = True
-                        changed = True
-                # FIRST: 依次取右部符号的 FIRST, 遇不可空即止
-                all_null = True
+                # 沿右部从左到右计算 FIRST(A): 终结符立即计入并停止,
+                # 只有可空的*非终结符*前缀才能越过; 空右部/全部可空才可空并加 ε。
+                prefix_nullable = True
                 for s in rhs:
                     if s in self.terminal_set:
+                        # 终结符既不可空也不能越过
                         if s not in first[lhs]:
                             first[lhs].add(s)
                             changed = True
-                        all_null = False
+                        prefix_nullable = False
                         break
+                    added = {x for x in first[s] if x != EPS}
                     before = len(first[lhs])
-                    first[lhs] |= {x for x in first[s] if x != EPS}
+                    first[lhs] |= added
                     if len(first[lhs]) != before:
                         changed = True
                     if not nullable[s]:
-                        all_null = False
+                        prefix_nullable = False
                         break
-                if all_null:
+                if prefix_nullable:
+                    # 空右部, 或右部是一串全部可空的非终结符
                     if EPS not in first[lhs]:
                         first[lhs].add(EPS)
+                        changed = True
+                    if not nullable[lhs]:
+                        nullable[lhs] = True
                         changed = True
 
         # FIRST/nullable 定点结束, 先挂到 self(FOLLOW 计算依赖 self._first_seq)

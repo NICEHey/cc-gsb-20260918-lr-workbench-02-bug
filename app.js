@@ -10,6 +10,10 @@
   // 全局状态
   // ---------------------------------------------------------------
   const state = C.createAppState();
+  // 建表与分析各用一个请求台账: 文法/模式改动同时作废旧建表与旧分析;
+  // 输入改动只作废分析请求(保留当前有效表)。
+  const buildReq = C.createRequestManager();
+  const parseReq = C.createRequestManager();
   let fixtures = [];
   let selectedState = 0;          // 状态族中当前选中的状态
   let selectedCell = null;        // {state, symbol} ACTION 单元格选择
@@ -38,11 +42,12 @@
     a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
   }
-  async function postJson(url, payload) {
+  async function postJson(url, payload, signal) {
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal,
     });
     let data = null;
     try { data = await resp.json(); } catch (_) { /* 非 JSON */ }
@@ -65,7 +70,7 @@
     return "接受";
   }
   function splitSymbols(raw) {
-    return raw.split(/[\s,，、]+/).filter((s) => s.length > 0);
+    return C.splitSymbolList(raw);
   }
   /** 终结符排序: 普通终结符按 Unicode 码点, 结束符 $ 固定最后(表格列惯例)。 */
   function terminalOrder(table) {
@@ -87,12 +92,18 @@
       const raw = localStorage.getItem(STORE_KEY);
       if (!raw) return;
       const obj = JSON.parse(raw);
-      const v = C.validateDraft(obj.draft);
-      if (!v.errors.length) {
-        state.draft = C.normalizeDraft(obj.draft);
-        state.mode = obj.mode === "LR1" ? "LR1" : "SLR";
-        state.input = typeof obj.input === "string" ? obj.input : "";
-      }
+      // 即使草稿当前校验不过(如右部 9 个符号/31 个终结符的待修正状态),
+      // 也原样恢复并由表单校验提示 —— 绝不在刷新后把超限输入静默丢弃。
+      const d = obj.draft;
+      const shapeOk = d && typeof d === "object" && !Array.isArray(d) &&
+        typeof d.name === "string" && typeof d.start === "string" &&
+        Array.isArray(d.terminals) && Array.isArray(d.productions) &&
+        d.productions.every((p) => p && typeof p === "object" &&
+          typeof p.id === "string" && typeof p.lhs === "string" && Array.isArray(p.rhs));
+      if (!shapeOk) return;
+      state.draft = C.normalizeDraft(d);
+      state.mode = obj.mode === "LR1" ? "LR1" : "SLR";
+      state.input = typeof obj.input === "string" ? obj.input : "";
     } catch (_) { /* 损坏的缓存忽略, 使用默认草稿 */ }
   }
 
@@ -101,12 +112,17 @@
   // ---------------------------------------------------------------
   function markGrammarEdited() {
     C.grammarChanged(state);
+    // 文法改动立即作废旧建表与旧分析(连同可能在途的请求), 旧响应回来也不得落库。
+    buildReq.invalidate();
+    parseReq.invalidate();
     saveDraft();
     renderStaleness();
     renderRunAvailability();
   }
   function markInputEdited() {
     C.inputChanged(state, $("inputText").value);
+    // 输入改动只作废分析请求: 保留当前有效表, 但旧输入的轨迹/响应必须丢弃。
+    parseReq.invalidate();
     saveDraft();
     clearBanner($("runMessage"));
     renderRunAvailability();
@@ -146,7 +162,9 @@
       rhsIn.value = p.rhs.join(" "); rhsIn.placeholder = "留空 = ε";
       rhsIn.title = "右部符号用空白分隔; 留空表示 ε";
       rhsIn.addEventListener("input", () => {
-        p.rhs = splitSymbols(rhsIn.value).slice(0, C.LIMITS.maxRhs);
+        // 完整保留编辑中的符号(含超过 8 个的待修正输入); 是否合法交由校验提示,
+        // 绝不静默裁剪, 避免界面看到的文法与后台计算的文法不一致。
+        p.rhs = splitSymbols(rhsIn.value);
         markGrammarEdited(); renderMessages();
       });
 
@@ -215,7 +233,8 @@
       state.draft.start = e.target.value; markGrammarEdited(); renderMessages();
     });
     $("terminalsInput").addEventListener("input", (e) => {
-      state.draft.terminals = splitSymbols(e.target.value).slice(0, C.LIMITS.maxTerminals);
+      // 同样完整保留超过 30 个终结符的待修正输入, 由校验报错并锁定生成, 不裁剪。
+      state.draft.terminals = splitSymbols(e.target.value);
       markGrammarEdited(); renderMessages();
     });
     $("addProdBtn").addEventListener("click", addProduction);
@@ -235,6 +254,8 @@
       b.addEventListener("click", () => {
         if (state.playing || b.dataset.mode === state.mode) return;
         C.modeChanged(state, b.dataset.mode);
+        buildReq.invalidate();
+        parseReq.invalidate();
         saveDraft();
         renderMode(); renderStaleness(); renderRunAvailability(); renderTraceArea();
       });
@@ -265,6 +286,8 @@
     // 显式载入样例/导入成功后才替换草稿; 失败路径不会走到这里
     state.draft = C.normalizeDraft(draft);
     C.grammarChanged(state);
+    buildReq.invalidate();
+    parseReq.invalidate();
     if (typeof inputText === "string") {
       state.input = inputText;
       $("inputText").value = inputText;
@@ -354,40 +377,47 @@
   }
   async function generateTable() {
     if (!C.canGenerate(state)) return;
+    // 生成期间锁定按钮; 只有当前请求的成功/失败/收尾能解锁它,
+    // 被更新请求或文法/模式改动作废的旧响应一律静默, 不恢复任何控件状态。
     const btn = $("generateBtn");
     btn.disabled = true; btn.textContent = "生成中…";
     clearBanner($("tableBanner"));
-    try {
-      const table = await postJson("api/build", { grammar: state.draft, mode: state.mode });
-      C.tableGenerated(state, table);
-      selectedState = 0;
-      selectedCell = null;
-      renderTableArea();
-      renderStaleness();
-      renderRunAvailability();
-      renderTraceArea();
-      const nConf = table.conflicts.length;
-      if (nConf) {
-        const kinds = C.conflictSummary(table);
-        setBanner($("tableBanner"), "err",
-          `⚠ 分析表构造完成但存在 <b>${nConf}</b> 个冲突单元格` +
-          `（${Object.entries(kinds).map(([k, v]) => `${k} ×${v}`).join("，")}）。` +
-          `所有候选动作均已保留, 可查看与导出, 但<b>禁止启动输入分析</b>。`);
-      } else if (table.warnings && table.warnings.length) {
-        setBanner($("tableBanner"), "warn",
-          "分析表已生成, 无冲突。文法提示: " +
-          table.warnings.map(escapeHtml).join("；"));
-      } else {
-        setBanner($("tableBanner"), "ok",
-          `分析表已生成: ${state.mode} · ${table.states.length} 个状态 · 无冲突, 可以启动分析。`);
-      }
-    } catch (err) {
+    const result = await C.requestBuild(state, buildReq, (signal) =>
+      postJson("api/build", { grammar: state.draft, mode: state.mode }, signal));
+    if (result.status === "stale") return;  // 已过期: 不得触碰界面(含按钮文案)
+    if (result.status === "error") {
       setBanner($("tableBanner"), "err",
-        "生成失败: " + escapeHtml(err.message) +
+        "生成失败: " + escapeHtml(result.error.message) +
         "<br>未产生新的分析表, 已有内容(若存在)保持不变。");
-    } finally {
+      // 注意: 这里不能再调 renderStaleness() —— 无表分支会 clearBanner 清掉刚写的失败提示。
       btn.textContent = "生成分析表";
+      btn.disabled = C.validateDraft(state.draft).errors.length > 0 || state.playing;
       renderMessages();
+      return;
+    }
+    const table = result.table;
+    selectedState = 0;
+    selectedCell = null;
+    renderTableArea();
+    renderStaleness();
+    renderRunAvailability();
+    renderTraceArea();
+    btn.textContent = "生成分析表";
+    renderMessages();
+    const nConf = table.conflicts.length;
+    if (nConf) {
+      const kinds = C.conflictSummary(table);
+      setBanner($("tableBanner"), "err",
+        `⚠ 分析表构造完成但存在 <b>${nConf}</b> 个冲突单元格` +
+        `（${Object.entries(kinds).map(([k, v]) => `${k} ×${v}`).join("，")}）。` +
+        `所有候选动作均已保留, 可查看与导出, 但<b>禁止启动输入分析</b>。`);
+    } else if (table.warnings && table.warnings.length) {
+      setBanner($("tableBanner"), "warn",
+        "分析表已生成, 无冲突。文法提示: " +
+        table.warnings.map(escapeHtml).join("；"));
+    } else {
+      setBanner($("tableBanner"), "ok",
+        `分析表已生成: ${state.mode} · ${table.states.length} 个状态 · 无冲突, 可以启动分析。`);
     }
   }
 
@@ -428,6 +458,9 @@
     });
     $("generateBtn").disabled =
       grammarDisabled || C.validateDraft(state.draft).errors.length > 0;
+    // 文法/模式改动会作废在途建表请求, 按钮文案随失效视图一起复位;
+    // 仍属当前请求时不会走到这里(请求期间无编辑即无 renderStaleness 触发)。
+    $("generateBtn").textContent = "生成分析表";
     renderMode();
   }
 
@@ -873,10 +906,25 @@
       status.textContent = "自动执行中…";
       status.className = "badge badge-info";
     } else if (hasPb) {
-      const st = state.trace.status;
-      status.textContent = { accepted: "已接受", error: "出错", limit: "超步终止" }[st] || "就绪";
-      status.className = "badge " +
-        (st === "accepted" ? "badge-ok" : st === "error" ? "badge-err" : "badge-stale");
+      // 结论只由"当前执行位置"决定: 预计算轨迹即便最终是接受,
+      // 未走到最后一步也只能显示执行中; 后退后恢复未完成状态。
+      const outcome = C.playbackOutcome(state.pb);
+      if (outcome === "accepted") {
+        status.textContent = "已接受";
+        status.className = "badge badge-ok";
+      } else if (outcome === "error") {
+        status.textContent = "出错";
+        status.className = "badge badge-err";
+      } else if (outcome === "limit") {
+        status.textContent = "超步终止";
+        status.className = "badge badge-stale";
+      } else if (state.pb.pos === 0) {
+        status.textContent = "待执行";
+        status.className = "badge badge-info";
+      } else {
+        status.textContent = `执行中（第 ${state.pb.pos}/${state.trace.steps.length} 步）`;
+        status.className = "badge badge-info";
+      }
     } else {
       status.textContent = "表无冲突 · 可开始";
       status.className = "badge badge-ok";
@@ -898,21 +946,20 @@
     if (!C.canRunAnalysis(state) || state.playing) return;
     clearBanner($("runMessage"));
     $("startBtn").disabled = true;
-    try {
-      const result = await postJson("api/parse", {
-        grammar: state.draft, mode: state.mode, input: state.input,
-      });
-      // 以返回结果为准; 未知符号会在服务器开始前报错(走 catch), 不会到这里
-      C.traceLoaded(state, result);
+    // 身份含发起时输入; 返回期间输入/文法/模式变动都会得到 stale, 旧轨迹不落库。
+    const text = state.input;
+    const result = await C.requestParse(state, parseReq, text, (signal) =>
+      postJson("api/parse", { grammar: state.draft, mode: state.mode, input: text }, signal));
+    if (result.status === "stale") return;  // 过期成功/失败均静默, 控件状态由新编辑负责
+    if (result.status === "error") {
+      setBanner($("runMessage"), "err", "无法开始分析: " + escapeHtml(result.error.message));
       renderRunAvailability();
-      renderTraceArea();
-      renderTableHighlights();
-      if (result.status === "error") showTraceEndMessage(result);
-    } catch (err) {
-      setBanner($("runMessage"), "err", "无法开始分析: " + escapeHtml(err.message));
-    } finally {
-      renderRunAvailability();
+      return;
     }
+    renderRunAvailability();
+    renderTraceArea();
+    renderTableHighlights();
+    if (result.trace.status === "error") showTraceEndMessage(result.trace);
   }
 
   function showTraceEndMessage(result) {
