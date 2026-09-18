@@ -315,12 +315,13 @@ class Grammar:
             changed = False
             for idx in range(1, len(self.productions)):
                 lhs, rhs = self.productions[idx]
-                # nullable: 右部为空, 或右部符号全部可空
+                # nullable: 右部为空, 或右部符号全部是可空非终结符。
+                # 终结符永远不可空(nullable 表只含非终结符, get 不到即为 False)。
                 if not rhs:
                     if not nullable[lhs]:
                         nullable[lhs] = True
                         changed = True
-                elif all(s in self.terminal_set or nullable.get(s) for s in rhs):
+                elif all(nullable.get(s, False) for s in rhs):
                     if not nullable[lhs]:
                         nullable[lhs] = True
                         changed = True

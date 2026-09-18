@@ -146,7 +146,8 @@
       rhsIn.value = p.rhs.join(" "); rhsIn.placeholder = "留空 = ε";
       rhsIn.title = "右部符号用空白分隔; 留空表示 ε";
       rhsIn.addEventListener("input", () => {
-        p.rhs = splitSymbols(rhsIn.value).slice(0, C.LIMITS.maxRhs);
+        // 完整保留用户输入(含超限内容), 由校验明确报错; 绝不静默裁剪后按另一份文法计算
+        p.rhs = splitSymbols(rhsIn.value);
         markGrammarEdited(); renderMessages();
       });
 
@@ -215,7 +216,8 @@
       state.draft.start = e.target.value; markGrammarEdited(); renderMessages();
     });
     $("terminalsInput").addEventListener("input", (e) => {
-      state.draft.terminals = splitSymbols(e.target.value).slice(0, C.LIMITS.maxTerminals);
+      // 同上: 超限输入完整保留并提示, 禁止后台按裁剪后的终结符集合计算
+      state.draft.terminals = splitSymbols(e.target.value);
       markGrammarEdited(); renderMessages();
     });
     $("addProdBtn").addEventListener("click", addProduction);
